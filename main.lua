@@ -2,6 +2,8 @@
 
 local M = {}
 local NAME = "whatchanged"
+local SEARCH_DOMAIN_PATTERN = NAME:gsub("(%W)", "%%%1") .. " %d+"
+local DUMMY_KIND = 8
 local WRAP_MODES = { words = ui.Wrap.YES, trim = ui.Wrap.TRIM, none = ui.Wrap.NO }
 local NOTICE_ANIMATION = 0.25
 
@@ -10,14 +12,14 @@ local function url_key(url)
 end
 
 local function is_git_search(url)
-	return url.spec.is_search and url.spec.domain:match("^whatchanged %d+$") ~= nil
+	return url.spec.is_search and url.spec.domain:match("^" .. SEARCH_DOMAIN_PATTERN .. "$") ~= nil
 end
 
 local function notify(content, level)
-	ya.notify { title = "whatchanged", content = content, level = level or "error", timeout = 5 }
+	ya.notify { title = NAME, content = content, level = level or "error", timeout = 5 }
 end
 
-local ModeNotice = { _id = "whatchanged-notice" }
+local ModeNotice = { _id = NAME .. "-notice" }
 
 function ModeNotice:new(area)
 	return setmetatable({ _area = area }, { __index = self })
@@ -29,7 +31,7 @@ function ModeNotice:redraw()
 	local elements = {}
 	for _, notice in ipairs(self._state.mode_notices) do
 		local content = notice.content
-		local title = th.notify.icon_info .. " whatchanged"
+		local title = th.notify.icon_info .. " " .. NAME
 		local width = math.min(self._area.w, math.max(ui.width(content), ui.width(title)) + 2)
 		local y = self._area.bottom - 4 - math.floor(notice.offset + 0.5)
 		if width < 3 or y < self._area.y then
@@ -202,7 +204,7 @@ function M:setup(opts)
 		local flags = original(header)
 		local cwd = header._current.cwd
 		if is_git_search(cwd) then
-			return (flags:gsub("search: whatchanged %d+", "search: whatchanged", 1))
+			return (flags:gsub("search: " .. SEARCH_DOMAIN_PATTERN, "search: " .. NAME, 1))
 		end
 		return flags
 	end
@@ -348,7 +350,7 @@ function M:entry(job)
 		return toggle_preview()
 	end
 	if action ~= "toggle" and action ~= "refresh" and action ~= "adopt" then
-		return notify("Use: plugin whatchanged [toggle|refresh|preview]")
+		return notify("Use: plugin " .. NAME .. " [toggle|refresh|preview]")
 	end
 	local request = begin(action, job.args.tab)
 	if not request then
@@ -378,7 +380,7 @@ function M:entry(job)
 	if not records then
 		return fail(err)
 	end
-	local cwd = Url(root):into_search("whatchanged " .. request.key)
+	local cwd = Url(root):into_search(NAME .. " " .. request.key)
 	local view = {
 		root = root, cwd = tostring(cwd), origin = request.origin,
 		hidden = request.hidden, ticket = request.ticket, entries = {},
@@ -391,7 +393,7 @@ function M:entry(job)
 		local file = fs.file(url)
 		if not file then
 			mimes[tostring(url)] = "text/plain"
-			file = File { url = url, cha = Cha { mode = tonumber("100644", 8), kind = 8 } }
+			file = File { url = url, cha = Cha { mode = tonumber("100644", 8), kind = DUMMY_KIND } }
 		end
 		files[#files + 1] = file
 	end
