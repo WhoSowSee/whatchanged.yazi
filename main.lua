@@ -111,7 +111,9 @@ local function restore(view)
 	ya.emit("hidden", { view.hidden and "show" or "hide" })
 end
 
-local function inherited_view(state, tab, schedule)
+-- adoption is "pending", "loading", or "failed"; ready views leave it unset.
+-- Success replaces the view; canceled loads return to pending, errors require an explicit retry.
+local function reconcile_view(state, tab, schedule)
 	local cwd = tab.current.cwd
 	local key, location = tostring(tab.id.value), tostring(cwd)
 	local view = state.views[key]
@@ -154,13 +156,13 @@ local function inherited_view(state, tab, schedule)
 		end
 		view = {
 			cwd = location, root = donor and donor.root, origin = origin,
-			hidden = hidden, entries = donor and donor.entries or {}, pending = true,
+			hidden = hidden, entries = donor and donor.entries or {}, adoption = "pending",
 			preview_mode = donor and donor.preview_mode or "diff",
 		}
 		state.views[key] = view
 	end
-	if schedule and view.pending and not view.loading and not view.error and tab.id.value == cx.active.id.value then
-		view.loading = true
+	if schedule and view.adoption == "pending" and tab.id.value == cx.active.id.value then
+		view.adoption = "loading"
 		ya.emit("plugin", { NAME, "adopt --tab=" .. key })
 	end
 	return view, restored_hidden
@@ -173,10 +175,10 @@ function M:setup(opts)
 		self.notify = opts.notify == true
 		self.show_filename = opts.show_filename == true
 	end
-	if self.header_patched then
+	if self.initialized then
 		return
 	end
-	self.header_patched = true
+	self.initialized = true
 	self.views, self.requests = {}, {}
 	self.mode_notices = {}
 	Modal:children_add(setmetatable({ _state = self }, { __index = ModeNotice }), 1000)
@@ -190,10 +192,13 @@ function M:setup(opts)
 			end
 		end
 	end)
+	local function reconcile_active()
+		reconcile_view(self, cx.active, true)
+	end
+	ps.sub("tab", reconcile_active)
+	ps.sub("cd", reconcile_active)
 	local original = Header.flags
-	local state = self
 	Header.flags = function(header)
-		inherited_view(state, header._tab, true)
 		local flags = original(header)
 		local cwd = header._current.cwd
 		if is_git_search(cwd) then
@@ -208,18 +213,18 @@ local begin = ya.sync(function(state, action, target)
 	local key, cwd = tostring(tab.id.value), tostring(tab.current.cwd)
 	if action == "adopt" and target and key ~= tostring(target) then
 		local waiting = state.views[tostring(target)]
-		if waiting and waiting.pending then
-			waiting.loading = false
+		if waiting and waiting.adoption == "loading" then
+			waiting.adoption = "pending"
 		end
 		return
 	end
 	state.requests[key] = (state.requests[key] or 0) + 1
 	local hidden = tab.pref.show_hidden
-	local view, restored_hidden = inherited_view(state, tab, false)
+	local view, restored_hidden = reconcile_view(state, tab, false)
 	if restored_hidden ~= nil then
 		hidden = restored_hidden
 	end
-	if action == "adopt" and (not view or not view.pending) then
+	if action == "adopt" and (not view or not view.adoption) then
 		return
 	end
 	if view and action == "toggle" then
@@ -280,13 +285,17 @@ end)
 
 local finish_adoption = ya.sync(function(state, request, error)
 	local view = state.views[request.key]
-	if view and view.pending and state.requests[request.key] == request.ticket then
-		view.loading, view.error = false, error
+	if view and view.adoption and state.requests[request.key] == request.ticket then
+		view.adoption, view.error = error and "failed" or "pending", error
+		-- The tab may become active again between publish() rejecting and this callback.
+		if not error and tostring(cx.active.id.value) == request.key then
+			reconcile_view(state, cx.active, true)
+		end
 	end
 end)
 
 local toggle_preview = ya.sync(function(state)
-	local view = inherited_view(state, cx.active, true)
+	local view = reconcile_view(state, cx.active, true)
 	if not view then
 		return notify("Open the git changes view first", "info")
 	end
@@ -395,8 +404,9 @@ function M:entry(job)
 end
 
 local function active_item(state, job)
-	local view = inherited_view(state, cx.active, true)
-	if view then
+	local tab = cx.active
+	local view = state.views[tostring(tab.id.value)]
+	if view and Url(view.cwd) == tab.current.cwd and is_git_search(tab.current.cwd) then
 		local item = view.entries[url_key(job.file.url)]
 		if item then
 			return {
