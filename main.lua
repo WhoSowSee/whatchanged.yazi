@@ -476,110 +476,126 @@ local function diff_args(item, cached)
 	return args
 end
 
-local function collect_diff(item)
-	local lines, bytes, truncated = {}, 0, false
-	local max_bytes = 2 * 1024 * 1024
-	local function add(line)
+local DiffFilter = {}
+DiffFilter.__index = DiffFilter
+
+function DiffFilter:new(lines, title, status)
+	return setmetatable({ lines = lines, title = title, untracked = status == "??" }, self)
+end
+
+function DiffFilter:emit(line)
+	local lines = self.lines
+	if not self.started then
+		self.started = true
+		if #lines > 0 then
+			lines[#lines + 1] = ""
+		end
+		lines[#lines + 1] = "\27[1;33m" .. self.title .. "\27[0m"
+		if self.summary then
+			lines[#lines + 1] = self.summary
+		end
+		if line then
+			lines[#lines + 1] = ""
+		end
+	end
+	if line then
 		lines[#lines + 1] = line
 	end
-	local function section(title, cached)
-		local child, err = Command("git"):cwd(item.root):arg(diff_args(item, cached))
-			:env("GIT_OPTIONAL_LOCKS", "0"):stdout(Command.PIPED):stderr(Command.PIPED):spawn()
-		if not child then
-			add("git error: " .. tostring(err))
-			return
+end
+
+function DiffFilter:accept(line)
+	local plain = line:gsub("\27%[[0-?]*[ -/]*[@-~]", "")
+	if plain:match("^diff %-%-") then
+		self.in_hunk = false
+	elseif plain:sub(1, 2) == "@@" then
+		self.in_hunk = true
+	elseif self.in_hunk then
+		-- Start compact previews at meaningful content, trimming only leading blank
+		-- context. Blank additions and deletions still carry '+' or '-' and are kept.
+		if self.started or not plain:match("^ %s*$") then
+			self:emit(line)
 		end
-		local pending, stderr, started, in_hunk, summary = "", "", false, false, nil
-		local function heading()
-			started = true
-			if #lines > 0 then
-				add("")
+	elseif plain:match("^Binary files ") then
+		self:emit("Binary file changed")
+	elseif plain:match("^deleted file mode ") then
+		self.summary = "Deleted file"
+	elseif plain:match("^new file mode ") then
+		if not self.untracked then
+			self.summary = "New file"
+		end
+	elseif plain:match("^rename from ") then
+		self.summary = "Renamed file"
+	elseif plain:match("^copy from ") then
+		self.summary = "Copied file"
+	elseif plain:match("^old mode ") or plain:match("^new mode ") then
+		self.summary = "File permissions changed"
+	end
+end
+
+function DiffFilter:finish()
+	if not self.started and self.summary then
+		self:emit()
+	end
+end
+
+local function collect_diff_section(item, title, cached, lines, max_bytes)
+	local child, err = Command("git"):cwd(item.root):arg(diff_args(item, cached))
+		:env("GIT_OPTIONAL_LOCKS", "0"):stdout(Command.PIPED):stderr(Command.PIPED):spawn()
+	if not child then
+		lines[#lines + 1] = "git error: " .. tostring(err)
+		return 0, false
+	end
+	local filter = DiffFilter:new(lines, title, item.status)
+	local pending, stderr, bytes = "", "", 0
+	while true do
+		local chunk, event = child:read(8192)
+		if event == 2 then
+			break
+		end
+		chunk = string.char(table.unpack(chunk))
+		if event == 1 then
+			stderr = (stderr .. chunk):sub(1, 4096)
+		elseif event == 0 then
+			bytes = bytes + #chunk
+			pending = pending .. chunk
+			local stop = pending:find("\n", 1, true)
+			while stop do
+				local line = pending:sub(1, stop - 1):gsub("\r$", "")
+				pending = pending:sub(stop + 1)
+				filter:accept(line)
+				stop = pending:find("\n", 1, true)
 			end
-			add("\27[1;33m" .. title .. "\27[0m")
-			if summary then
-				add(summary)
+			if bytes >= max_bytes then
+				child:start_kill()
+				lines[#lines + 1] = "Preview truncated at 2 MiB"
+				return bytes, true
 			end
-		end
-		local function body(line)
-			if not started then
-				heading()
-				add("")
-			end
-			add(line)
-		end
-		local function accept(line)
-			local plain = line:gsub("\27%[[0-?]*[ -/]*[@-~]", "")
-			if plain:match("^diff %-%-") then
-				in_hunk = false
-			elseif plain:sub(1, 2) == "@@" then
-				in_hunk = true
-			elseif in_hunk then
-				if started or not plain:match("^ %s*$") then
-					body(line)
-				end
-			elseif plain:match("^Binary files ") then
-				body("Binary file changed")
-			elseif plain:match("^deleted file mode ") then
-				summary = "Deleted file"
-			elseif plain:match("^new file mode ") then
-				if item.status ~= "??" then
-					summary = "New file"
-				end
-			elseif plain:match("^rename from ") then
-				summary = "Renamed file"
-			elseif plain:match("^copy from ") then
-				summary = "Copied file"
-			elseif plain:match("^old mode ") or plain:match("^new mode ") then
-				summary = "File permissions changed"
-			end
-		end
-		while true do
-			local chunk, event = child:read(8192)
-			if event == 2 then
-				break
-			end
-			chunk = string.char(table.unpack(chunk))
-			if event == 1 then
-				stderr = (stderr .. chunk):sub(1, 4096)
-			elseif event == 0 then
-				bytes = bytes + #chunk
-				pending = pending .. chunk
-				local stop = pending:find("\n", 1, true)
-				while stop do
-					local line = pending:sub(1, stop - 1):gsub("\r$", "")
-					pending = pending:sub(stop + 1)
-					accept(line)
-					stop = pending:find("\n", 1, true)
-				end
-				if bytes >= max_bytes then
-					truncated = true
-					child:start_kill()
-					add("Preview truncated at 2 MiB")
-					return
-				end
-			end
-		end
-		local status, wait_err = child:wait()
-		if pending ~= "" then
-			accept(pending)
-		end
-		if not started and summary then
-			heading()
-		end
-		if not status or (not status.success and not (item.status == "??" and status.code == 1)) then
-			add("git error: " .. (stderr ~= "" and stderr or tostring(wait_err or "command failed")))
 		end
 	end
+	local status, wait_err = child:wait()
+	if pending ~= "" then
+		filter:accept(pending)
+	end
+	filter:finish()
+	if not status or (not status.success and not (item.status == "??" and status.code == 1)) then
+		lines[#lines + 1] = "git error: " .. (stderr ~= "" and stderr or tostring(wait_err or "command failed"))
+	end
+	return bytes, false
+end
+
+local function collect_diff(item)
+	local lines = {}
+	local max_bytes = 2 * 1024 * 1024
 	if item.status == "??" then
-		section("Untracked", false)
+		collect_diff_section(item, "Untracked", false, lines, max_bytes)
 	else
-		section("Staged", true)
+		local bytes, truncated = collect_diff_section(item, "Staged", true, lines, max_bytes)
 		if not truncated then
-			section("Unstaged", false)
+			collect_diff_section(item, "Unstaged", false, lines, max_bytes - bytes)
 		end
 	end
 	if #lines == 0 then
-		add("No diff content. Refresh the git changes list")
+		lines[1] = "No diff content. Refresh the git changes list"
 	end
 	return lines
 end
