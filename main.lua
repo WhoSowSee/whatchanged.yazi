@@ -6,6 +6,7 @@ local SEARCH_DOMAIN_PATTERN = NAME:gsub("(%W)", "%%%1") .. " %d+"
 local DUMMY_KIND = 8
 local WRAP_MODES = { words = ui.Wrap.YES, trim = ui.Wrap.TRIM, none = ui.Wrap.NO }
 local NOTICE_ANIMATION = 0.25
+local PREVIEW_LIMIT = 2 * 1024 * 1024
 
 local function url_key(url)
 	return tostring(fs.clean_url(url))
@@ -170,12 +171,50 @@ local function reconcile_view(state, tab, schedule)
 	return view, restored_hidden
 end
 
+local function update_layout(state)
+	local target
+	if state.git_ratio and is_git_search(cx.active.current.cwd) then
+		if not state.normal_ratio then
+			local ratio = rt.mgr.ratio
+			state.normal_ratio = { ratio[1], ratio[2], ratio[3] }
+		end
+		target = state.git_ratio
+	elseif state.normal_ratio then
+		target, state.normal_ratio = state.normal_ratio, nil
+	else
+		return
+	end
+	local ratio = rt.mgr.ratio
+	if ratio[1] ~= target[1] or ratio[2] ~= target[2] or ratio[3] ~= target[3] then
+		rt.mgr.ratio = { target[1], target[2], target[3] }
+		-- Reflow all panes and re-peek at the new preview width.
+		ya.emit("app:resize", {})
+	end
+end
+
 function M:setup(opts)
 	if opts then
 		assert(opts.wrap == nil or WRAP_MODES[opts.wrap], 'wrap must be "words", "trim", or "none"')
+		assert(opts.diff_style == nil or opts.diff_style == "unified" or opts.diff_style == "side-by-side",
+			'diff_style must be "unified" or "side-by-side"')
+		assert(opts.delta == nil or type(opts.delta) == "string" and opts.delta ~= "", "delta must be an executable name or path")
+		if opts.git_ratio then
+			local sum = 0
+			assert(type(opts.git_ratio) == "table" and #opts.git_ratio == 3, "git_ratio must contain three integers")
+			for i = 1, 3 do
+				local value = opts.git_ratio[i]
+				assert(type(value) == "number" and value >= 0 and value <= 65535 and value % 1 == 0,
+					"git_ratio values must be integers between 0 and 65535")
+				sum = sum + value
+			end
+			assert(sum > 0 and sum <= 65535, "git_ratio total must be between 1 and 65535")
+		end
 		self.wrap = WRAP_MODES[opts.wrap]
 		self.notify = opts.notify == true
 		self.show_filename = opts.show_filename == true
+		self.diff_style = opts.diff_style or "unified"
+		self.delta = opts.delta or "delta"
+		self.git_ratio = opts.git_ratio
 	end
 	if self.initialized then
 		return
@@ -196,6 +235,7 @@ function M:setup(opts)
 	end)
 	local function reconcile_active()
 		reconcile_view(self, cx.active, true)
+		update_layout(self)
 	end
 	ps.sub("tab", reconcile_active)
 	ps.sub("cd", reconcile_active)
@@ -426,15 +466,24 @@ local function original_previewer(job)
 	end
 end
 
-local preview_context = ya.sync(function(state, file, mime)
+local preview_context = ya.sync(function(state, file, mime, width)
 	local job = { file = file, mime = mime }
 	local item, view = active_item(state, job)
 	if item then
 		if view.preview_mode == "diff" then
 			item.wrap = state.wrap or rt.preview.wrap
 			item.show_filename = state.show_filename
+			item.diff_style = state.diff_style or "unified"
+			item.delta = state.delta or "delta"
+			item.light = rt.term.light() == true
+			item.width = width
+			item.renderer = table.concat({ item.diff_style, item.delta, tostring(item.light) }, "\0")
 			local cache = view.cache
-			if cache and cache.url == url_key(file.url) and cache.mtime == file.cha.mtime and cache.len == file.cha.len then
+			if cache and cache.url == url_key(file.url) and cache.ticket == view.ticket
+				and cache.mtime == file.cha.mtime and cache.len == file.cha.len
+				and cache.renderer == item.renderer
+				and (item.diff_style ~= "side-by-side" or cache.width == width) then
+				item.render_style = cache.render_style
 				return item, nil, cache.lines
 			end
 			return item
@@ -448,11 +497,12 @@ local preview_context = ya.sync(function(state, file, mime)
 	end
 end)
 
-local cache_preview = ya.sync(function(state, url, ticket, mtime, len, lines)
+local cache_preview = ya.sync(function(state, url, item, mtime, len, lines)
 	local view = state.views[tostring(cx.active.id.value)]
-	if view and view.ticket == ticket and Url(view.cwd) == cx.active.current.cwd and view.entries[url_key(url)] then
+	if view and view.ticket == item.ticket and Url(view.cwd) == cx.active.current.cwd and view.entries[url_key(url)] then
 		-- Refresh invalidates the cache by replacing the view.
-		view.cache = { url = url_key(url), mtime = mtime, len = len, lines = lines }
+		view.cache = { url = url_key(url), ticket = item.ticket, mtime = mtime, len = len,
+			renderer = item.renderer, width = item.width, render_style = item.render_style, lines = lines }
 	end
 end)
 
@@ -471,7 +521,7 @@ end
 local function diff_args(item, cached)
 	local args = {
 		"--no-pager", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv",
-		"--color=always", "--no-relative", "--submodule=short",
+		item.diff_style == "side-by-side" and "--color=never" or "--color=always", "--no-relative", "--submodule=short",
 	}
 	if item.status == "??" then
 		args[#args + 1] = "--no-index"
@@ -579,6 +629,7 @@ local function collect_diff_section(item, title, cached, lines, max_bytes)
 			end
 			if bytes >= max_bytes then
 				child:start_kill()
+				child:wait()
 				lines[#lines + 1] = "Preview truncated at 2 MiB"
 				return bytes, true
 			end
@@ -595,16 +646,82 @@ local function collect_diff_section(item, title, cached, lines, max_bytes)
 	return bytes, false
 end
 
-local function collect_diff(item)
-	local lines = {}
-	local max_bytes = 2 * 1024 * 1024
-	if item.status == "??" then
-		collect_diff_section(item, "Untracked", false, lines, max_bytes)
-	else
-		local bytes, truncated = collect_diff_section(item, "Staged", true, lines, max_bytes)
-		if not truncated then
-			collect_diff_section(item, "Unstaged", false, lines, max_bytes - bytes)
+local function collect_delta_section(item, title, cached, lines, max_bytes)
+	local git, err = Command("git"):cwd(item.root):arg(diff_args(item, cached))
+		:env("GIT_OPTIONAL_LOCKS", "0"):stdout(Command.PIPED):stderr(Command.NULL):spawn()
+	if not git then
+		return 0, false, "Could not run git: " .. tostring(err)
+	end
+	local delta
+	delta, err = Command(item.delta):cwd(item.root):arg {
+		"--no-gitconfig", "--side-by-side", "--line-numbers", "--paging=never",
+		"--width=" .. math.max(1, item.width), item.light and "--light" or "--dark",
+	}:stdin(git:take_stdout()):stdout(Command.PIPED):stderr(Command.NULL):spawn()
+	if not delta then
+		git:start_kill()
+		git:wait()
+		return 0, false, "Delta unavailable; install delta or check the delta option. Showing unified diff"
+	end
+	local output, pending, bytes, truncated = {}, "", 0, false
+	while true do
+		local chunk, event = delta:read(8192)
+		if event == 2 then
+			break
+		elseif event == 0 then
+			chunk = string.char(table.unpack(chunk))
+			bytes = bytes + #chunk
+			pending = pending .. chunk
+			local stop = pending:find("\n", 1, true)
+			while stop do
+				output[#output + 1] = pending:sub(1, stop - 1):gsub("\r$", "")
+				pending = pending:sub(stop + 1)
+				stop = pending:find("\n", 1, true)
+			end
+			if bytes >= max_bytes then
+				truncated = true
+				delta:start_kill()
+				git:start_kill()
+				break
+			end
 		end
+	end
+	local delta_status, git_status = delta:wait(), git:wait()
+	if not truncated and (not delta_status or not delta_status.success or not git_status
+		or not git_status.success and not (item.status == "??" and git_status.code == 1)) then
+		return bytes, false, "Delta could not render this diff. Showing unified diff"
+	end
+	if pending ~= "" and not truncated then
+		output[#output + 1] = pending
+	end
+	if #output > 0 or truncated then
+		if #lines > 0 then
+			lines[#lines + 1] = ""
+		end
+		lines[#lines + 1] = "\27[1;33m" .. title .. " (old | new)\27[0m"
+		for _, line in ipairs(output) do
+			lines[#lines + 1] = line
+		end
+	end
+	if truncated then
+		lines[#lines + 1] = "Preview truncated at 2 MiB"
+	end
+	return bytes, truncated
+end
+
+local function collect_diff(item, collector)
+	local lines = {}
+	local bytes, truncated, err
+	collector = collector or collect_diff_section
+	if item.status == "??" then
+		bytes, truncated, err = collector(item, "Untracked", false, lines, PREVIEW_LIMIT)
+	else
+		bytes, truncated, err = collector(item, "Staged", true, lines, PREVIEW_LIMIT)
+		if not truncated and not err then
+			bytes, truncated, err = collector(item, "Unstaged", false, lines, PREVIEW_LIMIT - bytes)
+		end
+	end
+	if err then
+		return nil, err
 	end
 	if #lines == 0 then
 		lines[1] = "No diff content. Refresh the git changes list"
@@ -613,13 +730,28 @@ local function collect_diff(item)
 end
 
 local function diff_peek(job, item, cached)
-	local source = cached or collect_diff(item)
+	local source = cached
 	if not cached then
-		cache_preview(Url(job.file.url), item.ticket, job.file.cha.mtime, job.file.cha.len, source)
+		item.render_style = item.diff_style
+		if item.diff_style == "side-by-side" then
+			local err
+			source, err = collect_diff(item, collect_delta_section)
+			if not source then
+				item.render_style = "unified"
+				local unified = setmetatable({ diff_style = "unified" }, { __index = item })
+				source = collect_diff(unified)
+				table.insert(source, 1, "")
+				table.insert(source, 1, err)
+			end
+		else
+			source = collect_diff(item)
+		end
+		cache_preview(Url(job.file.url), item, job.file.cha.mtime, job.file.cha.len, source)
 	end
 	local lines, count = {}, 0
 	local limit = job.skip + job.area.h
-	local opts = { ansi = true, tab_size = rt.preview.tab_size, wrap = item.wrap, width = job.area.w }
+	local opts = { ansi = true, tab_size = rt.preview.tab_size,
+		wrap = item.render_style == "side-by-side" and ui.Wrap.NO or item.wrap, width = job.area.w }
 	local function render(line)
 		local rendered = line == "" and { ui.Line("") } or ui.lines(line, opts)
 		for _, wrapped in ipairs(rendered) do
@@ -649,7 +781,7 @@ end
 
 function M:peek(job)
 	-- Transfer a matching copy; keep the preview job's original File alive.
-	local item, rule, cached, message = preview_context(File { url = Url(job.file.url), cha = job.file.cha }, job.mime)
+	local item, rule, cached, message = preview_context(File { url = Url(job.file.url), cha = job.file.cha }, job.mime, job.area.w)
 	if message then
 		return require("empty").msg(job, message)
 	elseif item then
