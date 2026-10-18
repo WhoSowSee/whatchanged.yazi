@@ -47,6 +47,8 @@ require("whatchanged"):setup {
   notify = false, -- true - show preview-mode notifications
   wrap = "words", -- "words" - keep indentation, "trim" - trim indentation, "none" - no wrapping
   show_filename = false, -- true - show the file path above the diff
+  show_status = true, -- false - hide per-file Git status labels
+  show_branch = true, -- false - hide the branch / tracking / file-count header
 }
 ```
 
@@ -77,7 +79,50 @@ desc = "Refresh git changes"
 on = [ "<A-g>", "v" ]
 run = "plugin whatchanged preview"
 desc = "Toggle diff / file content"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "s" ]
+run = "plugin whatchanged staged"
+desc = "Show staged changes"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "w" ]
+run = "plugin whatchanged unstaged"
+desc = "Show unstaged changes"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "a" ]
+run = "plugin whatchanged all"
+desc = "Show all changes"
 ```
+
+## Change filters and branch status
+
+`all`, `staged`, and `unstaged` open the corresponding change list. Refresh keeps
+the current filter, and a tab duplicated from a changes view inherits it. A file
+with both staged and unstaged changes appears in both lists; each list previews
+only its corresponding diff section. Untracked files and unresolved conflicts
+appear in the unstaged list. `preview` still switches to the file's current content.
+
+File labels distinguish `[staged]`, `[modified]`, `[staged+modified]`, `[new]`, and
+`[conflict]`. The header shows the active filter and repository-wide file counts;
+`modified` includes untracked files and conflicts, and a file can count as both
+modified and staged.
+
+For example, `main → origin/main ↓2 ↑1` means two commits to pull and one to push.
+These numbers use local tracking refs from the last fetch; the plugin never
+fetches or modifies the index. Branches without an upstream, deleted upstreams,
+unborn branches, and detached HEAD are shown explicitly. Use `refresh` after
+external Git operations to update the list and header. Ordinary directories and
+other plugins' search results retain their usual labels, header, and previews.
+
+## Validation
+
+Run `python3 tests/acceptance.py` with Git, tmux, ripgrep (`rg`), Python 3.9+, and Yazi v26.8.15+
+in `PATH`. This uses a private tmux server and temporary repositories/configuration;
+it leaves the user's Yazi configuration and repositories untouched. Screens and
+diagnostics are retained in the printed artifact directory when a check fails.
+Set `YAZI_BINARY=/path/to/yazi` to test another installed Yazi version.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/catppuccin/catppuccin/main/assets/footers/gray0_ctp_on_line.svg?sanitize=true" alt="catppuccin" />

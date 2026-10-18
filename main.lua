@@ -6,6 +6,54 @@ local SEARCH_DOMAIN_PATTERN = NAME:gsub("(%W)", "%%%1") .. " %d+"
 local DUMMY_KIND = 8
 local WRAP_MODES = { words = ui.Wrap.YES, trim = ui.Wrap.TRIM, none = ui.Wrap.NO }
 local NOTICE_ANIMATION = 0.25
+local FILTERS = { all = true, staged = true, unstaged = true }
+
+local function status_flags(status)
+	if status == "??" then
+		return false, false, true, false
+	elseif status:find("U", 1, true) or status == "AA" or status == "DD" then
+		return false, false, false, true
+	end
+	return status:sub(1, 1) ~= " ", status:sub(2, 2) ~= " ", false, false
+end
+
+local function status_label(status)
+	local staged, modified, untracked, conflict = status_flags(status)
+	if conflict then return "conflict" end
+	if untracked then return "new" end
+	if staged and modified then return "staged+modified" end
+	return staged and "staged" or "modified"
+end
+
+local function include_status(status, filter)
+	if filter == "all" then return true end
+	local staged, modified, untracked, conflict = status_flags(status)
+	return filter == "staged" and staged or filter == "unstaged" and (modified or untracked or conflict)
+end
+
+local function count_status(records)
+	local counts = { staged = 0, modified = 0, untracked = 0, conflict = 0 }
+	for _, item in ipairs(records) do
+		local staged, modified, untracked, conflict = status_flags(item.status)
+		if staged then counts.staged = counts.staged + 1 end
+		if modified or untracked or conflict then counts.modified = counts.modified + 1 end
+		if untracked then counts.untracked = counts.untracked + 1 end
+		if conflict then counts.conflict = counts.conflict + 1 end
+	end
+	return counts
+end
+
+local function branch_text(meta)
+	if not meta or meta.error then return "Branch status unavailable" end
+	local branch = meta.head or "Unknown branch"
+	if branch == "(detached)" then return "HEAD@" .. (meta.oid or "?"):sub(1, 7) .. " (detached)" end
+	if meta.oid == "(initial)" then branch = branch .. " (unborn)" end
+	if not meta.upstream then return branch .. " (no upstream)" end
+	branch = branch .. " → " .. meta.upstream
+	if meta.gone then return branch .. " (upstream gone)" end
+	if meta.ahead == nil then return branch .. " (tracking unknown)" end
+	return branch .. " ↓" .. meta.behind .. " ↑" .. meta.ahead
+end
 
 local function url_key(url)
 	return tostring(fs.clean_url(url))
@@ -160,6 +208,7 @@ local function reconcile_view(state, tab, schedule)
 			cwd = location, root = donor and donor.root, origin = origin,
 			hidden = hidden, entries = donor and donor.entries or {}, adoption = "pending",
 			preview_mode = donor and donor.preview_mode or "diff",
+			filter = donor and donor.filter or "all",
 		}
 		state.views[key] = view
 	end
@@ -171,12 +220,13 @@ local function reconcile_view(state, tab, schedule)
 end
 
 function M:setup(opts)
-	if opts then
-		assert(opts.wrap == nil or WRAP_MODES[opts.wrap], 'wrap must be "words", "trim", or "none"')
-		self.wrap = WRAP_MODES[opts.wrap]
-		self.notify = opts.notify == true
-		self.show_filename = opts.show_filename == true
-	end
+	opts = opts or {}
+	self.show_status = opts.show_status ~= false
+	self.show_branch = opts.show_branch ~= false
+	assert(opts.wrap == nil or WRAP_MODES[opts.wrap], 'wrap must be "words", "trim", or "none"')
+	self.wrap = WRAP_MODES[opts.wrap]
+	self.notify = opts.notify == true
+	self.show_filename = opts.show_filename == true
 	if self.initialized then
 		return
 	end
@@ -208,6 +258,23 @@ function M:setup(opts)
 		end
 		return flags
 	end
+	Linemode:children_add(function(line)
+		if not self.show_status or not line._file.in_current then return "" end
+		local view = self.views[tostring(cx.active.id.value)]
+		if not view or Url(view.cwd) ~= cx.active.current.cwd then return "" end
+		local item = view.entries[url_key(line._file.url)]
+		return item and ui.Line { " [", status_label(item.status), "]" } or ""
+	end, 1600)
+	Header:children_add(function(header)
+		local view = self.views[tostring(header._tab.id.value)]
+		if not self.show_branch or not view or not view.counts or Url(view.cwd) ~= header._current.cwd then
+			return ""
+		end
+		local counts = view.counts
+		local text = string.format(" [%s] %s | modified:%d staged:%d new:%d conflicts:%d ",
+			view.filter, branch_text(view.branch), counts.modified, counts.staged, counts.untracked, counts.conflict)
+		return ui.Line(ui.truncate(text, { max = math.max(1, header._area.w - 1) }))
+	end, 500, Header.RIGHT)
 end
 
 local begin = ya.sync(function(state, action, target)
@@ -241,7 +308,7 @@ local begin = ya.sync(function(state, action, target)
 		hidden = view.hidden
 	end
 	local hovered
-	if action == "adopt" and tab.current.hovered then
+	if view and tab.current.hovered then
 		local relative = tab.current.hovered.url:strip_prefix(tab.current.cwd)
 		hovered = relative and tostring(relative)
 	end
@@ -252,6 +319,7 @@ local begin = ya.sync(function(state, action, target)
 		root = view and view.root,
 		hovered = hovered,
 		preview_mode = view and view.preview_mode or "diff",
+		filter = FILTERS[action] and action or view and view.filter or "all",
 	}
 end)
 
@@ -318,6 +386,37 @@ local function git_output(cwd, args)
 	return output.stdout
 end
 
+local function read_branch(root)
+	local raw, err = git_output(root, {
+		"status", "--porcelain=v2", "--branch", "--ahead-behind", "-z", "--untracked-files=no",
+	})
+	if not raw then return { error = err } end
+	local meta = {}
+	for record in raw:gmatch("([^\0]+)\0") do
+		-- Stop before file records: rename source paths may themselves start with '# '.
+		if record:sub(1, 2) ~= "# " then break end
+		local name, value = record:match("^# branch%.([%w]+) (.*)$")
+		if name == "head" or name == "oid" or name == "upstream" then
+			meta[name] = value
+		elseif name == "ab" then
+			local ahead, behind = value:match("^%+(%d+) %-(%d+)$")
+			meta.ahead, meta.behind = tonumber(ahead), tonumber(behind)
+		end
+	end
+	-- A missing upstream ref has no branch.ab. Query only local refs; never fetch.
+	if meta.head and meta.head ~= "(detached)" and meta.oid ~= "(initial)" and meta.ahead == nil then
+		local tracking = git_output(root, {
+			"for-each-ref", "--format=%(upstream:short)%00%(upstream:track)%00", "refs/heads/" .. meta.head,
+		})
+		if tracking then
+			local upstream, track = tracking:match("^([^\0]*)\0([^\0]*)\0")
+			if upstream and upstream ~= "" then meta.upstream = upstream end
+			meta.gone = track == "[gone]"
+		end
+	end
+	return meta
+end
+
 -- -z does not quote paths and reverses rename order: destination NUL source NUL.
 local function parse_status(raw)
 	local records, pos = {}, 1
@@ -349,8 +448,8 @@ function M:entry(job)
 	if action == "preview" then
 		return toggle_preview()
 	end
-	if action ~= "toggle" and action ~= "refresh" and action ~= "adopt" then
-		return notify("Use: plugin " .. NAME .. " [toggle|refresh|preview]")
+	if action ~= "toggle" and action ~= "refresh" and action ~= "adopt" and not FILTERS[action] then
+		return notify("Use: plugin " .. NAME .. " [toggle|refresh|preview|all|staged|unstaged]")
 	end
 	local request = begin(action, job.args.tab)
 	if not request then
@@ -384,24 +483,29 @@ function M:entry(job)
 	local view = {
 		root = root, cwd = tostring(cwd), origin = request.origin,
 		hidden = request.hidden, ticket = request.ticket, entries = {},
-		preview_mode = request.preview_mode,
+		preview_mode = request.preview_mode, filter = request.filter,
+		branch = read_branch(root), counts = count_status(records),
 	}
 	local files, mimes = {}, {}
 	for _, item in ipairs(records) do
 		local url = cwd:join(item.path)
 		view.entries[url_key(url)] = item
-		local file = fs.file(url)
-		if not file then
-			mimes[tostring(url)] = "text/plain"
-			file = File { url = url, cha = Cha { mode = tonumber("100644", 8), kind = DUMMY_KIND } }
+		if include_status(item.status, view.filter) then
+			local file = fs.file(url)
+			if not file then
+				mimes[tostring(url)] = "text/plain"
+				file = File { url = url, cha = Cha { mode = tonumber("100644", 8), kind = DUMMY_KIND } }
+			end
+			files[#files + 1] = file
 		end
-		files[#files + 1] = file
 	end
+	local hovered = request.hovered and view.entries[url_key(cwd:join(request.hovered))]
+	if not hovered or not include_status(hovered.status, view.filter) then request.hovered = nil end
 	local published = publish(request, view, files, mimes)
 	if not published and action == "adopt" then
 		finish_adoption(request)
 	elseif published and #files == 0 then
-		notify("Working tree is clean", "info")
+		notify(view.filter == "all" and "Working tree is clean" or "No " .. view.filter .. " changes", "info")
 	end
 end
 
@@ -413,6 +517,7 @@ local function active_item(state, job)
 		if item then
 			return {
 				root = view.root, path = item.path, old_path = item.old_path, status = item.status, ticket = view.ticket,
+				filter = view.filter,
 			}, view
 		end
 	end
@@ -601,8 +706,11 @@ local function collect_diff(item)
 	if item.status == "??" then
 		collect_diff_section(item, "Untracked", false, lines, max_bytes)
 	else
-		local bytes, truncated = collect_diff_section(item, "Staged", true, lines, max_bytes)
-		if not truncated then
+		local bytes, truncated = 0, false
+		if item.filter ~= "unstaged" then
+			bytes, truncated = collect_diff_section(item, "Staged", true, lines, max_bytes)
+		end
+		if not truncated and item.filter ~= "staged" then
 			collect_diff_section(item, "Unstaged", false, lines, max_bytes - bytes)
 		end
 	end
