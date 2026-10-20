@@ -44,7 +44,7 @@ require("whatchanged"):setup()
 
 ```lua
 require("whatchanged"):setup {
-  notify = false, -- true - показывать уведомления при переключении превью
+  notify = false, -- true - показывать уведомления плагина, включая ошибки
   wrap = "words", -- "words" - сохранять отступы, "trim" - удалять отступы, "none" - без переноса
   show_filename = false, -- true - показывать путь файла над diff
   show_status = true, -- false - скрывать метки Git-статуса файлов

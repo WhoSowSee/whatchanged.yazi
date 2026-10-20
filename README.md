@@ -44,7 +44,7 @@ Or with optional settings:
 
 ```lua
 require("whatchanged"):setup {
-  notify = false, -- true - show preview-mode notifications
+  notify = false, -- true - show plugin notifications, including errors
   wrap = "words", -- "words" - keep indentation, "trim" - trim indentation, "none" - no wrapping
   show_filename = false, -- true - show the file path above the diff
   show_status = true, -- false - hide per-file Git status labels

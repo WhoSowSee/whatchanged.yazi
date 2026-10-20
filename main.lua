@@ -102,6 +102,7 @@ local function new_notice(message, now, offset)
 end
 
 local function push_notice(state, content, level)
+	if not state.notify then return end
 	level = level or "info"
 	if not state.mode_notices or not state.notice_sender then
 		return ya.notify { title = NAME, content = content, level = level, timeout = 5 }
@@ -403,9 +404,7 @@ local toggle_preview = ya.sync(function(state)
 	end
 	view.preview_mode = view.preview_mode == "source" and "diff" or "source"
 	ya.emit("peek", { 0, force = true })
-	if state.notify then
-		push_notice(state, view.preview_mode == "source" and "Preview: file content" or "Preview: git diff")
-	end
+	push_notice(state, view.preview_mode == "source" and "Preview: file content" or "Preview: git diff")
 end)
 
 local function git_output(cwd, args)
