@@ -47,8 +47,14 @@ require("whatchanged"):setup {
   notify = false, -- true - показывать уведомления плагина, включая ошибки
   wrap = "words", -- "words" - сохранять отступы, "trim" - удалять отступы, "none" - без переноса
   show_filename = false, -- true - показывать путь файла над diff
+
   show_status = true, -- false - скрывать метки Git-статуса файлов
   show_branch = true, -- false - скрывать ветку, синхронизацию и счётчики файлов
+
+  diff_style = "unified", -- "side-by-side" использует Delta; "unified" — Git diff или Delta, если указан параметр ниже:
+  -- delta = "delta", -- имя из PATH или полный путь, например "C:/Tools/delta.exe"
+
+  -- git_ratio = { 0, 1, 4 }, -- 0% родитель, 20% список, 80% превью
 }
 ```
 

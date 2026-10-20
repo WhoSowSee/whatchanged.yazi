@@ -47,8 +47,14 @@ require("whatchanged"):setup {
   notify = false, -- true - show plugin notifications, including errors
   wrap = "words", -- "words" - keep indentation, "trim" - trim indentation, "none" - no wrapping
   show_filename = false, -- true - show the file path above the diff
+
   show_status = true, -- false - hide per-file Git status labels
   show_branch = true, -- false - hide the branch, tracking status and file counts
+
+  diff_style = "unified", -- "side-by-side" uses Delta; "unified" uses Git diff, or Delta if set below:
+  -- delta = "delta", -- name in PATH or full path, e.g. "C:/Tools/delta.exe"
+
+  -- git_ratio = { 0, 1, 4 }, -- 0% parent, 20% file list, 80% preview
 }
 ```
 

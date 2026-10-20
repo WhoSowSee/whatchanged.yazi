@@ -6,6 +6,7 @@ local SEARCH_DOMAIN_PATTERN = NAME:gsub("(%W)", "%%%1") .. " %d+"
 local DUMMY_KIND = 8
 local WRAP_MODES = { words = ui.Wrap.YES, trim = ui.Wrap.TRIM, none = ui.Wrap.NO }
 local NOTICE_ANIMATION = 0.25
+local PREVIEW_LIMIT = 2 * 1024 * 1024
 local FILTERS = { all = true, staged = true, unstaged = true }
 local STATUS_FIELDS = { ["1"] = 8, ["2"] = 9, u = 10 }
 
@@ -229,8 +230,45 @@ local function reconcile_view(state, tab, schedule)
 	return view, restored_hidden
 end
 
+local function update_layout(state)
+	local target
+	if state.git_ratio and is_git_search(cx.active.current.cwd) then
+		if not state.normal_ratio then
+			local ratio = rt.mgr.ratio
+			state.normal_ratio = { ratio[1], ratio[2], ratio[3] }
+		end
+		target = state.git_ratio
+	elseif state.normal_ratio then
+		target, state.normal_ratio = state.normal_ratio, nil
+	else
+		return
+	end
+	local ratio = rt.mgr.ratio
+	if ratio[1] ~= target[1] or ratio[2] ~= target[2] or ratio[3] ~= target[3] then
+		rt.mgr.ratio = { target[1], target[2], target[3] }
+		ya.emit("app:resize", {})
+	end
+end
+
 function M:setup(opts)
 	opts = opts or {}
+	assert(opts.diff_style == nil or opts.diff_style == "unified" or opts.diff_style == "side-by-side",
+		'diff_style must be "unified" or "side-by-side"')
+	assert(opts.delta == nil or type(opts.delta) == "string" and opts.delta ~= "", "delta must be an executable name or path")
+	if opts.git_ratio then
+		assert(type(opts.git_ratio) == "table" and #opts.git_ratio == 3, "git_ratio must contain three integers")
+		local sum = 0
+		for i = 1, 3 do
+			local value = opts.git_ratio[i]
+			assert(type(value) == "number" and value >= 0 and value <= 65535 and value % 1 == 0,
+				"git_ratio values must be integers between 0 and 65535")
+			sum = sum + value
+		end
+		assert(sum > 0 and sum <= 65535, "git_ratio total must be between 1 and 65535")
+	end
+	self.diff_style = opts.diff_style or "unified"
+	self.delta = opts.delta or (self.diff_style == "side-by-side" and "delta" or nil)
+	self.git_ratio = opts.git_ratio
 	self.show_status = opts.show_status ~= false
 	self.show_branch = opts.show_branch ~= false
 	assert(opts.wrap == nil or WRAP_MODES[opts.wrap], 'wrap must be "words", "trim", or "none"')
@@ -256,6 +294,7 @@ function M:setup(opts)
 	end)
 	local function reconcile_active()
 		reconcile_view(self, cx.active, true)
+		update_layout(self)
 	end
 	ps.sub("tab", reconcile_active)
 	ps.sub("cd", reconcile_active)
@@ -572,7 +611,7 @@ local function original_previewer(file, mime)
 	end
 end
 
-local preview_context = ya.sync(function(state, file, mime)
+local preview_context = ya.sync(function(state, file, mime, width)
 	local entry, view = active_item(state, file)
 	if entry then
 		if view.preview_mode == "diff" then
@@ -580,9 +619,14 @@ local preview_context = ya.sync(function(state, file, mime)
 				root = view.root, path = entry.path, old_path = entry.old_path, status = entry.status,
 				ticket = view.ticket, filter = view.filter, wrap = state.wrap or rt.preview.wrap,
 				show_filename = state.show_filename,
+				diff_style = state.diff_style or "unified", delta = state.delta,
+				light = rt.term.light() == true, width = width,
 			}
+			item.renderer = table.concat({ item.diff_style, item.delta or "", tostring(item.light) }, "\0")
 			local cache = view.cache
-			if cache and cache.url == url_key(file.url) and cache.mtime == file.cha.mtime and cache.len == file.cha.len then
+			if cache and cache.url == url_key(file.url) and cache.mtime == file.cha.mtime and cache.len == file.cha.len
+				and cache.renderer == item.renderer and (not item.delta or cache.width == width) then
+				item.render_style = cache.render_style
 				return item, nil, cache.lines
 			end
 			return item
@@ -596,11 +640,12 @@ local preview_context = ya.sync(function(state, file, mime)
 	end
 end)
 
-local cache_preview = ya.sync(function(state, url, ticket, mtime, len, lines)
+local cache_preview = ya.sync(function(state, url, item, mtime, len, lines)
 	local view = view_for_tab(state, cx.active)
-	if view and view.ticket == ticket and view.entries[url_key(url)] then
+	if view and view.ticket == item.ticket and view.entries[url_key(url)] then
 		-- Refresh invalidates the cache by replacing the view.
-		view.cache = { url = url_key(url), mtime = mtime, len = len, lines = lines }
+		view.cache = { url = url_key(url), mtime = mtime, len = len, lines = lines,
+			renderer = item.renderer, width = item.width, render_style = item.render_style }
 	end
 end)
 
@@ -623,7 +668,7 @@ end
 local function diff_args(item, cached)
 	local args = {
 		"--no-pager", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv",
-		"--color=always", "--no-relative", "--submodule=short",
+		item.delta and "--color=never" or "--color=always", "--no-relative", "--submodule=short",
 	}
 	if item.status == "??" then
 		args[#args + 1] = "--no-index"
@@ -702,17 +747,10 @@ function DiffFilter:finish()
 	end
 end
 
-local function collect_diff_section(item, title, cached, lines, max_bytes)
-	local child, err = Command("git"):cwd(item.root):arg(diff_args(item, cached))
-		:env("GIT_OPTIONAL_LOCKS", "0"):stdout(Command.PIPED):stderr(Command.PIPED):spawn()
-	if not child then
-		lines[#lines + 1] = "git error: " .. tostring(err)
-		return 0, false
-	end
-	local filter = DiffFilter:new(lines, title, item.status)
+local function read_diff(child, max_bytes, accept)
 	local pending, stderr, bytes = "", "", 0
 	while true do
-		local chunk, event = child:read(8192)
+		local chunk, event = child:read(math.min(8192, max_bytes - bytes))
 		if event == 2 then
 			break
 		end
@@ -726,41 +764,96 @@ local function collect_diff_section(item, title, cached, lines, max_bytes)
 			while stop do
 				local line = pending:sub(1, stop - 1):gsub("\r$", "")
 				pending = pending:sub(stop + 1)
-				filter:accept(line)
+				accept(line)
 				stop = pending:find("\n", 1, true)
 			end
 			if bytes >= max_bytes then
-				child:start_kill()
-				lines[#lines + 1] = "Preview truncated at 2 MiB"
-				return bytes, true
+				return bytes, true, stderr
 			end
 		end
 	end
-	local status, wait_err = child:wait()
 	if pending ~= "" then
-		filter:accept(pending)
+		accept(pending)
 	end
+	return bytes, false, stderr
+end
+
+local function collect_diff_section(item, title, cached, lines, max_bytes)
+	local child, err = Command("git"):cwd(item.root):arg(diff_args(item, cached))
+		:env("GIT_OPTIONAL_LOCKS", "0"):stdout(Command.PIPED):stderr(Command.PIPED):spawn()
+	if not child then
+		lines[#lines + 1] = "git error: " .. tostring(err)
+		return 0, false
+	end
+	local filter = DiffFilter:new(lines, title, item.status)
+	local bytes, truncated, stderr = read_diff(child, max_bytes, function(line) filter:accept(line) end)
+	if truncated then child:start_kill() end
+	local status, wait_err = child:wait()
 	filter:finish()
-	if not status or (not status.success and not (item.status == "??" and status.code == 1)) then
+	if truncated then
+		lines[#lines + 1] = "Preview truncated at 2 MiB"
+	elseif not status or (not status.success and not (item.status == "??" and status.code == 1)) then
 		lines[#lines + 1] = "git error: " .. (stderr ~= "" and stderr or tostring(wait_err or "command failed"))
 	end
-	return bytes, false
+	return bytes, truncated
+end
+
+local function collect_delta_section(item, title, cached, lines, max_bytes)
+	local git, err = Command("git"):cwd(item.root):arg(diff_args(item, cached))
+		:env("GIT_OPTIONAL_LOCKS", "0"):stdout(Command.PIPED):stderr(Command.NULL):spawn()
+	if not git then
+		return 0, false, "Could not run git: " .. tostring(err)
+	end
+	local args = {
+		"--no-gitconfig", "--line-numbers", "--paging=never",
+		"--width=" .. math.max(1, item.width), item.light and "--light" or "--dark",
+	}
+	if item.diff_style == "side-by-side" then args[#args + 1] = "--side-by-side" end
+	local command = Command(item.delta):cwd(item.root):arg(args)
+		:stdin(git:take_stdout()):stdout(Command.PIPED):stderr(Command.NULL)
+	local delta = command:spawn()
+	-- The reusable Command retains its pipe reader after spawn, even if Delta fails.
+	command:stdin(Command.NULL)
+	if not delta then
+		git:start_kill()
+		git:wait()
+		return 0, false, "Delta unavailable; install delta or check the delta option. Showing unified diff"
+	end
+	local output = {}
+	local bytes, truncated = read_diff(delta, max_bytes, function(line) output[#output + 1] = line end)
+	if truncated then delta:start_kill() end
+	local delta_status = delta:wait()
+	if truncated or not delta_status or not delta_status.success then git:start_kill() end
+	local git_status = git:wait()
+	if not truncated and (not delta_status or not delta_status.success or not git_status
+		or not git_status.success and not (item.status == "??" and git_status.code == 1)) then
+		return bytes, false, "Delta could not render this diff. Showing unified diff"
+	end
+	if #output > 0 then
+		if #lines > 0 then lines[#lines + 1] = "" end
+		local columns = item.diff_style == "side-by-side" and " [old | new]" or ""
+		lines[#lines + 1] = "\27[1;33m" .. title .. columns .. "\27[0m"
+		for _, line in ipairs(output) do lines[#lines + 1] = line end
+	end
+	if truncated then lines[#lines + 1] = "Preview truncated at 2 MiB" end
+	return bytes, truncated
 end
 
 local function collect_diff(item)
 	local lines = {}
-	local max_bytes = 2 * 1024 * 1024
+	local bytes, truncated, err = 0, false, nil
+	local collector = item.delta and collect_delta_section or collect_diff_section
 	if item.status == "??" then
-		collect_diff_section(item, "Untracked", false, lines, max_bytes)
+		bytes, truncated, err = collector(item, "Untracked", false, lines, PREVIEW_LIMIT)
 	else
-		local bytes, truncated = 0, false
 		if item.filter ~= "unstaged" then
-			bytes, truncated = collect_diff_section(item, "Staged", true, lines, max_bytes)
+			bytes, truncated, err = collector(item, "Staged", true, lines, PREVIEW_LIMIT)
 		end
-		if not truncated and item.filter ~= "staged" then
-			collect_diff_section(item, "Unstaged", false, lines, max_bytes - bytes)
+		if not truncated and not err and item.filter ~= "staged" then
+			bytes, truncated, err = collector(item, "Unstaged", false, lines, PREVIEW_LIMIT - bytes)
 		end
 	end
+	if err then return nil, err end
 	if #lines == 0 then
 		lines[1] = "No diff content. Refresh the git changes list"
 	end
@@ -768,13 +861,24 @@ local function collect_diff(item)
 end
 
 local function diff_peek(job, item, cached)
-	local source = cached or collect_diff(item)
+	local source = cached
 	if not cached then
-		cache_preview(Url(job.file.url), item.ticket, job.file.cha.mtime, job.file.cha.len, source)
+		item.render_style = item.diff_style
+		local err
+		source, err = collect_diff(item)
+		if not source then
+			item.render_style = "unified"
+			local unified = setmetatable({ delta = false }, { __index = item })
+			source = collect_diff(unified)
+			table.insert(source, 1, "")
+			table.insert(source, 1, err)
+		end
+		cache_preview(Url(job.file.url), item, job.file.cha.mtime, job.file.cha.len, source)
 	end
 	local lines, count = {}, 0
 	local limit = job.skip + job.area.h
-	local opts = { ansi = true, tab_size = rt.preview.tab_size, wrap = item.wrap, width = job.area.w }
+	local opts = { ansi = true, tab_size = rt.preview.tab_size,
+		wrap = item.render_style == "side-by-side" and ui.Wrap.NO or item.wrap, width = job.area.w }
 	local function render(line)
 		local rendered = line == "" and { ui.Line("") } or ui.lines(line, opts)
 		for _, wrapped in ipairs(rendered) do
@@ -804,7 +908,7 @@ end
 
 function M:peek(job)
 	-- Transfer a matching copy; keep the preview job's original File alive.
-	local item, rule, cached, message = preview_context(File { url = Url(job.file.url), cha = job.file.cha }, job.mime)
+	local item, rule, cached, message = preview_context(File { url = Url(job.file.url), cha = job.file.cha }, job.mime, job.area.w)
 	if message then
 		return require("empty").msg(job, message)
 	elseif item then
