@@ -47,6 +47,8 @@ require("whatchanged"):setup {
   notify = false, -- true - show preview-mode notifications
   wrap = "words", -- "words" - keep indentation, "trim" - trim indentation, "none" - no wrapping
   show_filename = false, -- true - show the file path above the diff
+  show_status = true, -- false - hide per-file Git status labels
+  show_branch = true, -- false - hide the branch, tracking status and file counts
 }
 ```
 
@@ -64,7 +66,7 @@ In `keymap.toml`:
 
 ```toml
 [[mgr.prepend_keymap]]
-on = [ "<A-g>", "c" ]
+on = [ "<A-g>", "a" ]
 run = "plugin whatchanged"
 desc = "Toggle git changes"
 
@@ -77,6 +79,16 @@ desc = "Refresh git changes"
 on = [ "<A-g>", "v" ]
 run = "plugin whatchanged preview"
 desc = "Toggle diff / file content"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "s" ]
+run = "plugin whatchanged staged"
+desc = "Show staged changes"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "w" ]
+run = "plugin whatchanged unstaged"
+desc = "Show unstaged changes"
 ```
 
 <p align="center">

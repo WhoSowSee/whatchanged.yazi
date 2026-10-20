@@ -47,6 +47,8 @@ require("whatchanged"):setup {
   notify = false, -- true - показывать уведомления при переключении превью
   wrap = "words", -- "words" - сохранять отступы, "trim" - удалять отступы, "none" - без переноса
   show_filename = false, -- true - показывать путь файла над diff
+  show_status = true, -- false - скрывать метки Git-статуса файлов
+  show_branch = true, -- false - скрывать ветку, синхронизацию и счётчики файлов
 }
 ```
 
@@ -64,9 +66,9 @@ prepend_previewers = [
 
 ```toml
 [[mgr.prepend_keymap]]
-on = [ "<A-g>", "c" ]
+on = [ "<A-g>", "a" ]
 run = "plugin whatchanged"
-desc = "Список git-изменений"
+desc = "Переключить git-изменения"
 
 [[mgr.prepend_keymap]]
 on = [ "<A-g>", "r" ]
@@ -77,6 +79,16 @@ desc = "Обновить git-изменения"
 on = [ "<A-g>", "v" ]
 run = "plugin whatchanged preview"
 desc = "Переключить diff / содержимое"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "s" ]
+run = "plugin whatchanged staged"
+desc = "Показать индексированные изменения"
+
+[[mgr.prepend_keymap]]
+on = [ "<A-g>", "w" ]
+run = "plugin whatchanged unstaged"
+desc = "Показать неиндексированные изменения"
 ```
 
 <p align="center">
